@@ -28,3 +28,4 @@ jobs:
         goos: linux
         goarch: amd64
         binary_name: rtop
+        sha256sum: true

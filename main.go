@@ -26,6 +26,10 @@ THE SOFTWARE.
 package main
 
 import (
+
+	"encoding/json"
+	"gopkg.in/yaml.v2"
+
 	"fmt"
 	"io"
 	"log"
@@ -33,13 +37,18 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"crypto/rsa"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"io/ioutil"
 )
 
 const VERSION = "1.0"
@@ -55,14 +64,16 @@ func usage(code int) {
 		`rtop %s - (c) 2015 RapidLoop - MIT Licensed - http://rtop-monitor.org
 rtop monitors server statistics over an ssh connection
 
-Usage: rtop [-i private-key-file] [user@]host[:port] [interval]
+Usage: rtop [-i private-key-file] [-t interval] [-n namedCollection] [user@]host[:port]
 
 	-i private-key-file
 		PEM-encoded private key file to use (default: ~/.ssh/id_rsa if present)
 	[user@]host[:port]
 		the SSH server to connect to, with optional username and port
-	interval
+	-t interval
 		refresh interval in seconds (default: %d)
+	-n namedCollection
+		collect a single named checkpoint collection instead of continuous collections
 
 `, VERSION, DEFAULT_REFRESH)
 	os.Exit(code)
@@ -77,9 +88,14 @@ func shift(q []string) (ok bool, val string, qnew []string) {
 	return
 }
 
-func parseCmdLine() (host string, port int, user, key string, interval time.Duration) {
+func parseCmdLine() (hosts []Section, interval time.Duration, bootstrap bool, onlyBootstrap bool, namedCollection string, testFile string) {
 	ok, arg, args := shift(os.Args)
-	var argKey, argHost, argInt string
+	var argKey,  argInt string
+	bootstrap = false
+	onlyBootstrap = false
+	namedCollection = "NOT_A_NAMED_COLLECTION"
+	testFile = "NO_TEST_FILE"
+	var hostStrings []string
 	for ok {
 		ok, arg, args = shift(args)
 		if !ok {
@@ -93,51 +109,116 @@ func parseCmdLine() (host string, port int, user, key string, interval time.Dura
 			if !ok {
 				usage(1)
 			}
-		} else if len(argHost) == 0 {
-			argHost = arg
-		} else if len(argInt) == 0 {
+		} else if arg == "-b" {
+			bootstrap = true
+		} else if arg == "-B" {
+			bootstrap = true
+			onlyBootstrap = true
+		} else if arg == "-t" {
 			argInt = arg
+		} else if arg == "-n" {
+			ok, namedCollection, args = shift(args)
+			if !ok {
+				usage(1)
+			}
+		} else if arg == "-f" {
+			ok, testFile, args = shift(args)
+			if !ok {
+				usage(1)
+			}
 		} else {
-			usage(1)
+			hostStrings = append(hostStrings, arg)
 		}
 	}
-	if len(argHost) == 0 || argHost[0] == '-' {
+	if len(hostStrings) == 0 {
 		usage(1)
 	}
 
+	var key string
 	// key
 	if len(argKey) != 0 {
 		key = argKey
 	} // else key remains ""
-
-	// user, addr
-	var addr string
-	if i := strings.Index(argHost, "@"); i != -1 {
-		user = argHost[:i]
-		if i+1 >= len(argHost) {
-			usage(1)
-		}
-		addr = argHost[i+1:]
-	} else {
-		// user remains ""
-		addr = argHost
+	if bootstrap {
+		key = "bootstrap.key"
 	}
 
-	// addr -> host, port
-	if p := strings.Split(addr, ":"); len(p) == 2 {
-		host = p[0]
+	for _, argHost := range hostStrings {
+		var addr string
+		var username string
+		var host string
+		var port int
+		if i := strings.Index(argHost, "@"); i != -1 {
+			username = argHost[:i]
+			if i+1 >= len(argHost) {
+				usage(1)
+			}
+			addr = argHost[i+1:]
+		} else {
+			// username remains ""
+			addr = argHost
+		}
+
+		// addr -> host, port
+		if p := strings.Split(addr, ":"); len(p) == 2 {
+			host = p[0]
+			var err error
+			if port, err = strconv.Atoi(p[1]); err != nil {
+				log.Printf("bad port: %v", err)
+				usage(1)
+			}
+			if port <= 0 || port >= 65536 {
+				log.Printf("bad port: %d", port)
+				usage(1)
+			}
+		} else {
+			host = addr
+			// port remains 0
+		}
+
+		// get current user
 		var err error
-		if port, err = strconv.Atoi(p[1]); err != nil {
-			log.Printf("bad port: %v", err)
-			usage(1)
+		currentUser, err = user.Current()
+		if err != nil {
+			log.Print(err)
+			return
 		}
-		if port <= 0 || port >= 65536 {
-			log.Printf("bad port: %d", port)
-			usage(1)
+
+		// fill from ~/.ssh/config if possible
+		sshConfig := filepath.Join(currentUser.HomeDir, ".ssh", "config")
+		if _, err := os.Stat(sshConfig); err == nil {
+			if parseSshConfig(sshConfig) {
+				shost, sport, suser, skey := getSshEntry(host)
+				if len(shost) > 0 {
+					host = shost
+				}
+				if sport != 0 && port == 0 {
+					port = sport
+				}
+				if len(suser) > 0 && len(username) == 0 {
+					username = suser
+				}
+				if len(skey) > 0 && len(key) == 0 {
+					key = skey
+				}
+				// log.Printf("after sshconfig: %s %d %s %s", host, port, username, key)
+			}
 		}
-	} else {
-		host = addr
-		// port remains 0
+
+		// fill in still-unknown ones with defaults
+		if port == 0 {
+			port = 22
+		}
+		if len(username) == 0 {
+			username = currentUser.Username
+		}
+		if len(key) == 0 {
+			idrsap := filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa")
+			if _, err := os.Stat(idrsap); err == nil {
+				key = idrsap
+			}
+		}
+		hosts = append(hosts, Section{ host, port, username, key })
 	}
 
 	// interval
@@ -165,168 +246,230 @@ func main() {
 	log.SetFlags(0)
 
 	// get params from command line
-	host, port, username, key, interval := parseCmdLine()
+	hosts, interval, bootstrap, onlyBootstrap, namedCollection, testFile := parseCmdLine()
 	// log.Printf("cmdline: %s %d %s %s", host, port, username, key)
-
-	// get current user
-	var err error
-	currentUser, err = user.Current()
-	if err != nil {
-		log.Print(err)
-		return
-	}
-
-	// fill from ~/.ssh/config if possible
-	sshConfig := filepath.Join(currentUser.HomeDir, ".ssh", "config")
-	if _, err := os.Stat(sshConfig); err == nil {
-		if parseSshConfig(sshConfig) {
-			shost, sport, suser, skey := getSshEntry(host)
-			if len(shost) > 0 {
-				host = shost
-			}
-			if sport != 0 && port == 0 {
-				port = sport
-			}
-			if len(suser) > 0 && len(username) == 0 {
-				username = suser
-			}
-			if len(skey) > 0 && len(key) == 0 {
-				key = skey
-			}
-			// log.Printf("after sshconfig: %s %d %s %s", host, port, username, key)
-		}
-	}
-
-	// fill in still-unknown ones with defaults
-	if port == 0 {
-		port = 22
-	}
-	if len(username) == 0 {
-		username = currentUser.Username
-	}
-	if len(key) == 0 {
-		idrsap := filepath.Join(currentUser.HomeDir, ".ssh", "id_rsa")
-		if _, err := os.Stat(idrsap); err == nil {
-			key = idrsap
-		}
-	}
 	if interval == 0 {
 		interval = DEFAULT_REFRESH * time.Second
 	}
 	// log.Printf("after defaults: %s %d %s %s", host, port, username, key)
 	// log.Printf("interval: %v", interval)
 
-	addr := fmt.Sprintf("%s:%d", host, port)
-	client := sshConnect(username, addr, key)
+	if bootstrap {
+		var privateKeyString string
+		if _, err := os.Stat("bootstrap.key"); os.IsNotExist(err) {
+			if _, err := os.Stat("bootstrap.key.pub"); os.IsNotExist(err) {
+				privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
+				if err != nil {
+					fmt.Printf("Bootstrapping failed: %s\n", err);
+					os.Exit(1)
+				}
+				privateKeyFile, err := os.Create("bootstrap.key")
+				defer privateKeyFile.Close()
+				if err != nil {
+					fmt.Printf("Bootstrapping failed: %s\n", err);
+					os.Exit(1)
+				}
+				privateKeyPEM := &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)}
+				if err := pem.Encode(privateKeyFile, privateKeyPEM); err != nil {
+					fmt.Printf("Bootstrapping failed: %s\n", err);
+					os.Exit(1)
+				}
+				pub, err := ssh.NewPublicKey(&privateKey.PublicKey)
+				if err != nil {
+					fmt.Printf("Bootstrapping failed: %s\n", err);
+					os.Exit(1)
+				}
+				privateKeyBin := ssh.MarshalAuthorizedKey(pub)
+				ioutil.WriteFile("bootstrap.key.pub", privateKeyBin, 0655)
+				privateKeyString = fmt.Sprintf("%s", privateKeyBin)
+			} else {
+				fmt.Println("bootstrap.key.pub exists but bootstrap.key does not exist. Either put bootstrap.key back or clean up bootstrap.key.pub and rerun bootstrap")
+				os.Exit(1)
+			}
+		} else {
+			if _, err := os.Stat("bootstrap.key.pub"); os.IsNotExist(err) {
+				fmt.Println("bootstrap.key exists but bootstrap.key.pubdoes not exist. Either put bootstrap.key back or clean up bootstrap.key.pub and rerun bootstrap")
+				os.Exit(1)
+			} else {
+				privateKeyBin, err := ioutil.ReadFile("bootstrap.key.pub")
+				if err != nil {
+					fmt.Printf("bootstrap.key.pub could not be read: %s", err)
+					os.Exit(1)
+				}
+				privateKeyString = fmt.Sprintf("%s", privateKeyBin)
+			}
+		}
 
-	output := getOutput()
-	// the loop
-	showStats(output, client)
+		for _, host := range hosts {
+			bootstrapper(host, privateKeyString)
+			host.IdentityFile = "bootstrap.key"
+		}
+		if onlyBootstrap {
+			os.Exit(0)
+		}
+	}
+
+	if _, err := os.Stat("timeSeries"); os.IsNotExist(err) {
+		err := os.Mkdir("timeSeries", 0755)
+		if err != nil {
+			fmt.Printf("Error creating timeSeries directory: %s", err)
+		}
+	}
+
+	var dataCollectors []DataCollector
+	if testFile != "NO_TEST_FILE" {
+
+		yamlFile, err := ioutil.ReadFile(testFile)
+		if err != nil {
+			fmt.Printf("ERROR cannot read yaml file: %s\n", err)
+			os.Exit(1)
+		}
+		err = yaml.Unmarshal(yamlFile, &dataCollectors)
+		if err != nil {
+			fmt.Printf("ERROR cannot unmarshal yaml: %s\n", err)
+			os.Exit(1)
+		}
+	} else {
+		dataCollectors = make([]DataCollector, 0)
+	}
+
+	if namedCollection != "NOT_A_NAMED_COLLECTION" {
+		if _, err := os.Stat("collections"); os.IsNotExist(err) {
+			err := os.Mkdir("collections", 0755)
+			if err != nil {
+				fmt.Printf("Error creating timeSeries directory: %s", err)
+			}
+		}
+		for _, host := range hosts {
+			//TODO make this parallellized with a sync.WaitGroup
+			singleCollection(host, dataCollectors, namedCollection)
+		}
+		os.Exit(0)
+	}
+
+	for _, host := range hosts {
+		go mainLoop(host, interval, dataCollectors)
+	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
-	timer := time.Tick(interval)
-	done := false
-	for !done {
-		select {
-		case <-sig:
-			done = true
-			fmt.Println()
-		case <-timer:
-			showStats(output, client)
+	<-sig
+}
+
+func bootstrapper( host Section, privateKeyString string ) {
+	addr := fmt.Sprintf("%s:%d", host.Hostname, host.Port)
+	client := sshConnect(host.User, addr, host.IdentityFile)
+	if client == nil {
+		fmt.Printf("Could not bootstrap %s", addr)
+		return
+	}
+	_, err := runCommand(client, fmt.Sprintf("grep \"%s\" ~/.ssh/authorized_keys", strings.TrimSuffix(privateKeyString, "\n")))
+	if err != nil {
+		fmt.Printf("\nAdding authorized key to %s from bootstrap.key.pub\n", addr)
+		_, err := runCommand(client, "mkdir -p ~/.ssh")
+		if err != nil {
+			fmt.Printf("mkdir -p ~/.ssh failed on %s: %s\n", addr, err)
+		}
+		_, err = runCommand(client, fmt.Sprintf("echo \"%s\" >> ~/.ssh/authorized_keys", privateKeyString))
+		if err != nil {
+			fmt.Printf("Adding authorized key failed on %s: %s", addr, err)
+		}
+	}
+	client.Close()
+}
+
+//TODO add returning of an error for better error handling
+func singleCollection( host Section, dataCollectors []DataCollector, name string) {
+	addr := fmt.Sprintf("%s:%d", host.Hostname, host.Port)
+	client := sshConnect(host.User, addr, host.IdentityFile)
+	if client == nil {
+		fmt.Println("Connection failed")
+		return
+	}
+
+	stats := Stats{}
+	stats.Time = time.Now()
+	stats.Name = name
+	stats.Collections = make(map[string]interface{})
+	err := getAllStats(client, &stats, dataCollectors)
+	if err != nil {
+		return
+	}
+	file, err := json.MarshalIndent(stats, "", " ")
+	if err != nil {
+		return
+	}
+	err = ioutil.WriteFile(fmt.Sprintf("collections/%s-%s.json", name, host.Hostname), file, 0644)
+	if err != nil {
+		return
+	}
+}
+
+func mainLoop( host Section, interval time.Duration, dataCollectors []DataCollector ) {
+	addr := fmt.Sprintf("%s:%d", host.Hostname, host.Port)
+	mainLoopDone := false
+	for !mainLoopDone {
+		fmt.Println("mainLoop")
+		nanoSeconds := time.Now().String()
+		fmt.Printf("time: %v\n", string(nanoSeconds))
+		client := sshConnect(host.User, addr, host.IdentityFile)
+		if client == nil {
+			fmt.Println("Connection failed")
+			time.Sleep(15 * time.Second)
+			continue
+		}
+
+		tsDir := fmt.Sprintf("timeSeries/%s", host.Hostname)
+		if _, err := os.Stat(tsDir); os.IsNotExist(err) {
+			err := os.Mkdir(tsDir, 0755)
+			if err != nil {
+				fmt.Printf("Error creating timeSeries directory: %s", err)
+			}
+		}
+		output := getOutput()
+		// the loop
+		//showStats(output, client, dbclient, host)
+		timer := time.Tick(interval)
+		done := false
+		for !done {
+			<-timer
+			nanoSeconds = time.Now().String()
+			fmt.Printf("time: %v\n", string(nanoSeconds))
+			err := showStats(output, client, host.Hostname, dataCollectors)
+			if err != nil {
+				done = true
+				fmt.Printf("show Stats Error  %s: %s\n", host.Hostname, err)
+			}
+			nanoSeconds = time.Now().String()
+			fmt.Printf("time: %v\n", string(nanoSeconds))
+			fmt.Println("showStatsLoop")
 		}
 	}
 }
 
-func showStats(output io.Writer, client *ssh.Client) {
+func showStats(output io.Writer, client *ssh.Client, host string, dataCollectors []DataCollector) error {
 	stats := Stats{}
-	getAllStats(client, &stats)
-	clearConsole()
-	used := stats.MemTotal - stats.MemFree - stats.MemBuffers - stats.MemCached
-	fmt.Fprintf(output,
-		`%s%s%s%s up %s%s%s
-
-Load:
-    %s%s %s %s%s
-
-CPU:
-    %s%.2f%s%% user, %s%.2f%s%% sys, %s%.2f%s%% nice, %s%.2f%s%% idle, %s%.2f%s%% iowait, %s%.2f%s%% hardirq, %s%.2f%s%% softirq, %s%.2f%s%% guest
-
-Processes:
-    %s%s%s running of %s%s%s total
-
-Memory:
-    free    = %s%s%s
-    used    = %s%s%s
-    buffers = %s%s%s
-    cached  = %s%s%s
-    swap    = %s%s%s free of %s%s%s
-
-`,
-		escClear,
-		escBrightWhite, stats.Hostname, escReset,
-		escBrightWhite, fmtUptime(&stats), escReset,
-		escBrightWhite, stats.Load1, stats.Load5, stats.Load10, escReset,
-		escBrightWhite, stats.CPU.User, escReset,
-		escBrightWhite, stats.CPU.System, escReset,
-		escBrightWhite, stats.CPU.Nice, escReset,
-		escBrightWhite, stats.CPU.Idle, escReset,
-		escBrightWhite, stats.CPU.Iowait, escReset,
-		escBrightWhite, stats.CPU.Irq, escReset,
-		escBrightWhite, stats.CPU.SoftIrq, escReset,
-		escBrightWhite, stats.CPU.Guest, escReset,
-		escBrightWhite, stats.RunningProcs, escReset,
-		escBrightWhite, stats.TotalProcs, escReset,
-		escBrightWhite, fmtBytes(stats.MemFree), escReset,
-		escBrightWhite, fmtBytes(used), escReset,
-		escBrightWhite, fmtBytes(stats.MemBuffers), escReset,
-		escBrightWhite, fmtBytes(stats.MemCached), escReset,
-		escBrightWhite, fmtBytes(stats.SwapFree), escReset,
-		escBrightWhite, fmtBytes(stats.SwapTotal), escReset,
-	)
-	if len(stats.FSInfos) > 0 {
-		fmt.Println("Filesystems:")
-		for _, fs := range stats.FSInfos {
-			fmt.Fprintf(output, "    %s%8s%s: %s%s%s free of %s%s%s\n",
-				escBrightWhite, fs.MountPoint, escReset,
-				escBrightWhite, fmtBytes(fs.Free), escReset,
-				escBrightWhite, fmtBytes(fs.Used+fs.Free), escReset,
-			)
-		}
-		fmt.Println()
+	stats.Time = time.Now()
+	stats.Name = strconv.FormatInt(stats.Time.Unix(), 10)
+	stats.Collections = make(map[string]interface{})
+	err := getAllStats(client, &stats, dataCollectors)
+	if err != nil {
+		return err
 	}
-	if len(stats.NetIntf) > 0 {
-		fmt.Println("Network Interfaces:")
-		keys := make([]string, 0, len(stats.NetIntf))
-		for intf := range stats.NetIntf {
-			keys = append(keys, intf)
-		}
-		sort.Strings(keys)
-		for _, intf := range keys {
-			info := stats.NetIntf[intf]
-			fmt.Fprintf(output, "    %s%s%s - %s%s%s",
-				escBrightWhite, intf, escReset,
-				escBrightWhite, info.IPv4, escReset,
-			)
-			if len(info.IPv6) > 0 {
-				fmt.Fprintf(output, ", %s%s%s\n",
-					escBrightWhite, info.IPv6, escReset,
-				)
-			} else {
-				fmt.Fprintf(output, "\n")
-			}
-			fmt.Fprintf(output, "      rx = %s%s%s, tx = %s%s%s\n",
-				escBrightWhite, fmtBytes(info.Rx), escReset,
-				escBrightWhite, fmtBytes(info.Tx), escReset,
-			)
-			fmt.Println()
-		}
-		fmt.Println()
+	file, err := json.MarshalIndent(stats, "", " ")
+	if err != nil {
+		return err
 	}
+	err = ioutil.WriteFile(fmt.Sprintf("timeSeries/%s/%d.json", host, stats.Time.Unix()), file, 0644)
+	if err != nil {
+		return err
+	}
+	//used := stats.MemTotal - stats.MemFree - stats.MemBuffers - stats.MemCached
+	return nil
 }
 
 const (
-	escClear       = "\033[H\033[2J"
-	escRed         = "\033[31m"
-	escReset       = "\033[0m"
+	escClear   = "\033[H\033[2J"
+	escRed     = "\033[31m"
+	escReset   = "\033[0m"
 	escBrightWhite = "\033[37;1m"
 )

@@ -26,6 +26,7 @@ THE SOFTWARE.
 package main
 
 import (
+
 	"bufio"
 	"golang.org/x/crypto/ssh"
 	"strconv"
@@ -71,7 +72,19 @@ type CPUInfo struct {
 	Guest   float32
 }
 
+type DynamicDataPoint struct {
+	Name string
+	Value string
+}
+
+type DataCollector struct {
+	Command string `yaml:"command"`
+	Name string `yaml:"name"`
+}
+
 type Stats struct {
+	Time         time.Time
+	Name         string
 	Uptime       time.Duration
 	Hostname     string
 	Load1        string
@@ -88,17 +101,48 @@ type Stats struct {
 	FSInfos      []FSInfo
 	NetIntf      map[string]NetIntfInfo
 	CPU          CPUInfo // or []CPUInfo to get all the cpu-core's stats?
+	//Collections []DynamicDataPoint
+	Collections map[string]interface{}
 }
 
-func getAllStats(client *ssh.Client, stats *Stats) {
-	getUptime(client, stats)
-	getHostname(client, stats)
-	getLoad(client, stats)
-	getMemInfo(client, stats)
-	getFSInfo(client, stats)
-	getInterfaces(client, stats)
-	getInterfaceInfo(client, stats)
-	getCPU(client, stats)
+func getAllStats(client *ssh.Client, stats *Stats, dataCollectors []DataCollector) error {
+    err := getUptime(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getHostname(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getLoad(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getMemInfo(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getFSInfo(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getInterfaces(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getInterfaceInfo(client, stats)
+    if err != nil {
+        return err
+    }
+	err = getCPU(client, stats)
+    if err != nil {
+        return err
+    }
+    err = getCollections(client, stats, dataCollectors)
+    if err != nil {
+        return err
+    }
+    return nil
 }
 
 func getUptime(client *ssh.Client, stats *Stats) (err error) {
@@ -374,4 +418,20 @@ func getCPU(client *ssh.Client, stats *Stats) (err error) {
 END:
 	preCPU = nowCPU
 	return
+}
+
+func getCollections(client *ssh.Client, stats *Stats, dataCollectors []DataCollector) (err error) {
+	// Run the tests from the yaml files
+
+	for _, cmd := range dataCollectors {
+
+		//TODO add the ability to bring in data in different formats such as json or yaml
+		lines, err := runCommand(client, cmd.Command)
+		if err != nil {
+			//TODO MARK THESTAT COLLECTION AS FAILED
+			continue
+		}
+		stats.Collections[cmd.Name] = strings.TrimSpace(lines)
+	}
+	return nil
 }

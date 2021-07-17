@@ -221,7 +221,7 @@ func sshConnect(user, addr, keypath string) (client *ssh.Client) {
 	client, err := ssh.Dial("tcp", addr, config)
 	if err != nil {
 		log.Print(err)
-		os.Exit(1)
+        return nil
 	}
 
 	return
@@ -230,7 +230,7 @@ func sshConnect(user, addr, keypath string) (client *ssh.Client) {
 func runCommand(client *ssh.Client, command string) (stdout string, err error) {
 	session, err := client.NewSession()
 	if err != nil {
-		//log.Print(err)
+		log.Print(err)
 		return
 	}
 	defer session.Close()

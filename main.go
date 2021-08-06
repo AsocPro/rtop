@@ -74,6 +74,8 @@ Usage: rtop [-i private-key-file] [-t interval] [-n namedCollection] [user@]host
 		refresh interval in seconds (default: %d)
 	-n namedCollection
 		collect a single named checkpoint collection instead of continuous collections
+	-d collectionLocation
+		The directory where the collections should be stored. This currently only works for named collections
 
 `, VERSION, DEFAULT_REFRESH)
 	os.Exit(code)
@@ -88,12 +90,13 @@ func shift(q []string) (ok bool, val string, qnew []string) {
 	return
 }
 
-func parseCmdLine() (hosts []Section, interval time.Duration, bootstrap bool, onlyBootstrap bool, namedCollection string, testFile string) {
+func parseCmdLine() (hosts []Section, interval time.Duration, bootstrap bool, onlyBootstrap bool, namedCollection string, collectionLocation string, testFile string) {
 	ok, arg, args := shift(os.Args)
 	var argKey,  argInt string
 	bootstrap = false
 	onlyBootstrap = false
 	namedCollection = "NOT_A_NAMED_COLLECTION"
+	collectionLocation = "collections"
 	testFile = "NO_TEST_FILE"
 	var hostStrings []string
 	for ok {
@@ -118,6 +121,11 @@ func parseCmdLine() (hosts []Section, interval time.Duration, bootstrap bool, on
 			argInt = arg
 		} else if arg == "-n" {
 			ok, namedCollection, args = shift(args)
+			if !ok {
+				usage(1)
+			}
+		} else if arg == "-d" {
+			ok, collectionLocation, args = shift(args)
 			if !ok {
 				usage(1)
 			}
@@ -246,7 +254,7 @@ func main() {
 	log.SetFlags(0)
 
 	// get params from command line
-	hosts, interval, bootstrap, onlyBootstrap, namedCollection, testFile := parseCmdLine()
+	hosts, interval, bootstrap, onlyBootstrap, namedCollection, collectionLocation, testFile := parseCmdLine()
 	// log.Printf("cmdline: %s %d %s %s", host, port, username, key)
 	if interval == 0 {
 		interval = DEFAULT_REFRESH * time.Second
@@ -334,15 +342,15 @@ func main() {
 	}
 
 	if namedCollection != "NOT_A_NAMED_COLLECTION" {
-		if _, err := os.Stat("collections"); os.IsNotExist(err) {
-			err := os.Mkdir("collections", 0755)
+		if _, err := os.Stat(collectionLocation); os.IsNotExist(err) {
+			err := os.Mkdir(collectionLocation, 0755)
 			if err != nil {
 				fmt.Printf("Error creating timeSeries directory: %s", err)
 			}
 		}
 		for _, host := range hosts {
 			//TODO make this parallellized with a sync.WaitGroup
-			singleCollection(host, dataCollectors, namedCollection)
+			singleCollection(host, dataCollectors, namedCollection, collectionLocation)
 		}
 		os.Exit(0)
 	}
@@ -378,7 +386,7 @@ func bootstrapper( host Section, privateKeyString string ) {
 }
 
 //TODO add returning of an error for better error handling
-func singleCollection( host Section, dataCollectors []DataCollector, name string) {
+func singleCollection( host Section, dataCollectors []DataCollector, name string, location string) {
 	addr := fmt.Sprintf("%s:%d", host.Hostname, host.Port)
 	client := sshConnect(host.User, addr, host.IdentityFile)
 	if client == nil {
@@ -398,7 +406,8 @@ func singleCollection( host Section, dataCollectors []DataCollector, name string
 	if err != nil {
 		return
 	}
-	err = ioutil.WriteFile(fmt.Sprintf("collections/%s-%s.json", name, host.Hostname), file, 0644)
+        filename := filepath.Join(location, fmt.Sprintf("%s-%s.json", name, host.Hostname))
+	err = ioutil.WriteFile(filename, file, 0644)
 	if err != nil {
 		return
 	}

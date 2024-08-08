@@ -397,7 +397,7 @@ func singleCollection( host Section, dataCollectors []DataCollector, name string
 	stats := Stats{}
 	stats.Time = time.Now()
 	stats.Name = name
-	stats.Collections = make(map[string]interface{})
+	stats.Collections = make(map[string]*DataCollection)
 	err := getAllStats(client, &stats, dataCollectors)
 	if err != nil {
 		return
@@ -459,7 +459,7 @@ func showStats(output io.Writer, client *ssh.Client, host string, dataCollectors
 	stats := Stats{}
 	stats.Time = time.Now()
 	stats.Name = strconv.FormatInt(stats.Time.Unix(), 10)
-	stats.Collections = make(map[string]interface{})
+	stats.Collections = make(map[string]*DataCollection)
 	err := getAllStats(client, &stats, dataCollectors)
 	if err != nil {
 		return err

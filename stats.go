@@ -81,6 +81,11 @@ type DataCollector struct {
 	Command string `yaml:"command"`
 	Name string `yaml:"name"`
 }
+type DataCollection struct {
+	Successful bool `yaml:"successful"`
+	Output string `yaml:"output"`
+	Name string `yaml:"name"`
+}
 
 type Stats struct {
 	Time         time.Time
@@ -102,7 +107,7 @@ type Stats struct {
 	NetIntf      map[string]NetIntfInfo
 	CPU          CPUInfo // or []CPUInfo to get all the cpu-core's stats?
 	//Collections []DynamicDataPoint
-	Collections map[string]interface{}
+	Collections map[string]*DataCollection
 }
 
 func getAllStats(client *ssh.Client, stats *Stats, dataCollectors []DataCollector) error {
@@ -426,12 +431,17 @@ func getCollections(client *ssh.Client, stats *Stats, dataCollectors []DataColle
 	for _, cmd := range dataCollectors {
 
 		//TODO add the ability to bring in data in different formats such as json or yaml
+		stats.Collections[cmd.Name] = new(DataCollection)
+		stats.Collections[cmd.Name].Name = cmd.Name
+
 		lines, err := runCommand(client, cmd.Command)
 		if err != nil {
+			stats.Collections[cmd.Name].Successful = false
 			//TODO MARK THESTAT COLLECTION AS FAILED
 			continue
 		}
-		stats.Collections[cmd.Name] = strings.TrimSpace(lines)
+		stats.Collections[cmd.Name].Successful = true
+		stats.Collections[cmd.Name].Output = strings.TrimSpace(lines)
 	}
 	return nil
 }

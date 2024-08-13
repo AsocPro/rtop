@@ -49,6 +49,9 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"io/ioutil"
+
+	"database/sql"
+	_ "github.com/lib/pq"
 )
 
 const VERSION = "1.0"
@@ -350,7 +353,7 @@ func main() {
 		}
 		for _, host := range hosts {
 			//TODO make this parallellized with a sync.WaitGroup
-			singleCollection(host, dataCollectors, namedCollection, collectionLocation)
+			singlePostgresCollection(host, dataCollectors, namedCollection, collectionLocation)
 		}
 		os.Exit(0)
 	}
@@ -410,6 +413,40 @@ func singleCollection( host Section, dataCollectors []DataCollector, name string
 	err = ioutil.WriteFile(filename, file, 0644)
 	if err != nil {
 		return
+	}
+}
+
+//TODO add returning of an error for better error handling
+func singlePostgresCollection( host Section, dataCollectors []DataCollector, name string, location string) {
+	addr := fmt.Sprintf("%s:%d", host.Hostname, host.Port)
+	client := sshConnect(host.User, addr, host.IdentityFile)
+	if client == nil {
+		fmt.Println("Connection failed")
+		return
+	}
+
+	stats := Stats{}
+	stats.Time = time.Now()
+	stats.Name = name
+	stats.Collections = make(map[string]*DataCollection)
+	err := getAllStats(client, &stats, dataCollectors)
+	if err != nil {
+		return
+	}
+	// TODO Postgresql
+	connStr := "postgres://postgres:arstneio@postgresql.management-console.svc.cluster.local/workshop?sslmode=disable"
+	db, err := sql.Open("postgres", connStr)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, coll := range stats.Collections {
+
+		_, err := db.Query("INSERT INTO collections(uid, name, success) VALUES($1, $2, $3) ON CONFLICT (uid) DO UPDATE SET success = excluded.success;", host.Hostname + "-" + coll.Name, coll.Name, coll.Successful)
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
 	}
 }
 
